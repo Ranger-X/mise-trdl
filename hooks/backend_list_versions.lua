@@ -1,85 +1,96 @@
 --- Lists available versions for a tool in this backend
 --- Documentation: https://mise.jdx.dev/backend-plugin-development.html#backendlistversions
---- @param ctx {tool: string} Context (tool = the tool name requested)
---- @return {versions: string[]} Table containing list of available versions
+--- @param ctx BackendListVersionsCtx
+--- @return BackendListVersionsResult
 function PLUGIN:BackendListVersions(ctx)
-    local tool = ctx.tool
+	local tool = ctx.tool
 
-    -- Validate tool name
-    if not tool or tool == "" then
-        error("Tool name cannot be empty")
-    end
+	if not tool or tool == "" then
+		error("Tool name cannot be empty")
+	end
 
-    -- Example implementations (choose/modify based on your backend):
+	local cmd = require("cmd")
+	local http = require("http")
+	local json = require("json")
+	local strings = require("strings")
 
-    -- Example 1: API-based version listing (like npm, pip, cargo)
-    local http = require("http")
-    local json = require("json")
+	local trdl_output = cmd.exec("trdl list")
 
-    -- Replace with your backend's API endpoint
-    local api_url = "https://api.<BACKEND>.org/packages/" .. tool .. "/versions"
+	local repo_url = nil
+	local lines = strings.split(trdl_output, "\n")
+	for _, line in ipairs(lines) do
+		line = strings.trim_space(line)
+		if line ~= "" then
+			local fields = {}
+			for field in line:gmatch("%S+") do
+				table.insert(fields, field)
+			end
 
-    local resp, err = http.get({
-        url = api_url,
-        -- headers = { ["Authorization"] = "Bearer " .. token } -- if needed
-    })
+			if fields[1] == tool then
+				repo_url = fields[2]
+				break
+			end
+		end
+	end
 
-    if err then
-        error("Failed to fetch versions for " .. tool .. ": " .. err)
-    end
+	if not repo_url then
+		error("TUF repository '" .. tool .. "' not found in `trdl list` output")
+	end
 
-    if resp.status_code ~= 200 then
-        error("API returned status " .. resp.status_code .. " for " .. tool)
-    end
+	local targets_url = repo_url .. "/targets.json"
+	local resp = http.get({ url = targets_url })
 
-    local data = json.decode(resp.body)
-    local versions = {}
+	if resp.status_code ~= 200 then
+		error(
+			"Failed to fetch TUF targets from " .. targets_url .. ": HTTP " .. resp.status_code
+		)
+	end
 
-    -- Parse versions from API response (adjust based on your API structure)
-    if data.versions then
-        for _, version in ipairs(data.versions) do
-            table.insert(versions, version)
-        end
-    end
+	local data = json.decode(resp.body)
 
-    -- Example 2: Command-line based version listing
-    --[[
-    local cmd = require("cmd")
+	if not data or not data.signed or not data.signed.targets then
+		error("Invalid TUF targets metadata from " .. targets_url)
+	end
 
-    -- Replace with your backend's command to list versions
-    local command = "<BACKEND> search " .. tool .. " --versions"
-    local result = cmd.exec(command)
+	local semver = require("semver")
 
-    if not result or result:match("error") then
-        error("Failed to fetch versions for " .. tool)
-    end
+	local version_set = {}
+	local versions = {}
+	local channel_set = {}
+	local channels = {}
 
-    local versions = {}
-    -- Parse command output to extract versions
-    for version in result:gmatch("[%d%.]+[%w%-]*") do
-        table.insert(versions, version)
-    end
-    --]]
+	for target_path, _ in pairs(data.signed.targets) do
+		if strings.has_prefix(target_path, "releases/") then
+			local parts = strings.split(target_path, "/")
+			if #parts >= 2 then
+				local version = parts[2]
+				if not version_set[version] then
+					version_set[version] = true
+					table.insert(versions, version)
+				end
+			end
+		elseif strings.has_prefix(target_path, "channels/") then
+			local parts = strings.split(target_path, "/")
+			if #parts >= 3 then
+				local channel = parts[3]
+				if not channel_set[channel] then
+					channel_set[channel] = true
+					table.insert(channels, channel)
+				end
+			end
+		end
+	end
 
-    -- Example 3: Registry file parsing
-    --[[
-    local file = require("file")
+	if #versions == 0 and #channels == 0 then
+		error("No versions found for " .. tool .. " in TUF repository at " .. repo_url)
+	end
 
-    -- Replace with path to your backend's registry or manifest
-    local registry_path = "/path/to/<BACKEND>/registry/" .. tool .. ".json"
+	versions = semver.sort(versions)
 
-    if not file.exists(registry_path) then
-        error("Tool " .. tool .. " not found in registry")
-    end
+	table.sort(channels)
+	for _, channel in ipairs(channels) do
+		table.insert(versions, channel)
+	end
 
-    local content = file.read(registry_path)
-    local data = json.decode(content)
-    local versions = data.versions or {}
-    --]]
-
-    if #versions == 0 then
-        error("No versions found for " .. tool)
-    end
-
-    return { versions = versions }
+	return { versions = versions }
 end
